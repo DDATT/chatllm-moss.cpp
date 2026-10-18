@@ -215,7 +215,8 @@ namespace chatllm
         MODEL_TYPE_GLM_ASR                  = 0x1000010D,
         MODEL_TYPE_QWEN3_TTS                = 0x1000010E,
         MODEL_TYPE_QWEN3_ASR                = 0x1000010F,
-        MODEL_TYPE_INTERN_DECISION          = 0x10000110,
+        MODEL_TYPE_MOSS_TTS                 = 0x10000110,
+        MODEL_TYPE_INTERN_DECISION          = 0x10000111,
 
         MODEL_TYPE_LLAMA_MULTI      = 0x20000001,
 

@@ -1,4 +1,5 @@
 #include "chat.h"
+#include <chrono>
 #include <iomanip>
 #include <iostream>
 #include <fstream>
@@ -838,12 +839,41 @@ static void print_decisions(const std::vector<std::string> &options, const std::
 static void play_audio(const std::vector<int16_t> &data, const int sample_rate, const int channels, TextStreamer &streamer, std::string export_fn)
 {
     auto fn = export_fn.size() > 0 ? export_fn : utils::tmpname();
+    const bool is_wav = export_fn.size() >= 4 &&
+                        (export_fn.substr(export_fn.size() - 4) == ".wav" || export_fn.substr(export_fn.size() - 4) == ".WAV");
     std::ofstream file(fn, std::ios::binary);
+    if (is_wav)
+    {
+        const uint32_t data_bytes = (uint32_t)(data.size() * sizeof(int16_t));
+        const uint32_t riff_size  = 36 + data_bytes;
+        const uint32_t fmt_size   = 16;
+        const uint16_t audio_fmt  = 1; // PCM
+        const uint16_t num_ch     = (uint16_t)(channels > 0 ? channels : 1);
+        const uint32_t sr         = (uint32_t)(sample_rate > 0 ? sample_rate : 24000);
+        const uint16_t bps        = 16;
+        const uint16_t block_align = num_ch * (bps / 8);
+        const uint32_t byte_rate   = sr * block_align;
+        file.write("RIFF", 4);
+        file.write((const char *)&riff_size, 4);
+        file.write("WAVEfmt ", 8);
+        file.write((const char *)&fmt_size, 4);
+        file.write((const char *)&audio_fmt, 2);
+        file.write((const char *)&num_ch, 2);
+        file.write((const char *)&sr, 4);
+        file.write((const char *)&byte_rate, 4);
+        file.write((const char *)&block_align, 2);
+        file.write((const char *)&bps, 2);
+        file.write("data", 4);
+        file.write((const char *)&data_bytes, 4);
+    }
     file.write((const char *)data.data(), data.size() * sizeof(data[0]));
     file.close();
 
     char cmd[2048];
-    sprintf(cmd, "ffplay -loglevel error -autoexit -f s16le -ch_layout %s -sample_rate %d \"%s\"", channels == 1 ? "mono" : "stereo", sample_rate, fn.c_str());
+    if (is_wav)
+        sprintf(cmd, "ffplay -loglevel error -autoexit \"%s\"", fn.c_str());
+    else
+        sprintf(cmd, "ffplay -loglevel error -autoexit -f s16le -ch_layout %s -sample_rate %d \"%s\"", channels == 1 ? "mono" : "stereo", sample_rate, fn.c_str());
     int r = system(cmd);
     if (export_fn.size() < 1)
         std::remove(fn.c_str());
@@ -1529,7 +1559,14 @@ int main(int argc, const char **argv)
         {
             if (args.beam_size < 1)
             {
+                auto t_load_start = std::chrono::high_resolution_clock::now();
                 chatllm::Pipeline pipeline(args.model_path, pipe_args);
+                auto t_load_end = std::chrono::high_resolution_clock::now();
+                double load_sec = std::chrono::duration<double>(t_load_end - t_load_start).count();
+                if (pipeline.is_loaded() && pipeline.model->get_purpose() == chatllm::ModelPurpose::TTS)
+                {
+                    std::cout << "[Pipeline] Model loaded in " << std::fixed << std::setprecision(3) << load_sec << " s\n" << std::flush;
+                }
                 chat(args, pipeline, streamer);
             }
             else

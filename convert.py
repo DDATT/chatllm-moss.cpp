@@ -265,7 +265,8 @@ class ModelType(Enum):
     GLM_ASR                 = 0x1000010D
     Qwen3_TTS               = 0x1000010E
     Qwen3_ASR               = 0x1000010F
-    Intern_Decision         = 0x10000110
+    MOSS_TTS                = 0x10000110
+    Intern_Decision         = 0x10000111
 
     LlaMAMulti    = 0x20000001
 
@@ -6271,6 +6272,496 @@ class Qwen3ASRConverter(BaseConverter):
 
         return weight_names
 
+class MossTTSConverter(BaseConverter):
+    MODEL_TYPE = ModelType.MOSS_TTS
+    model_files = []
+    codec_files = []
+    codec_config = None
+    audio_embed_rows = 1025
+
+    @staticmethod
+    def _fuse_wn(g: torch.Tensor, v: torch.Tensor) -> torch.Tensor:
+        g_f = g.float().reshape(-1, 1)
+        v_f = v.float().reshape(v.shape[0], v.shape[1])
+        norm = torch.sqrt((v_f ** 2).sum(dim=1, keepdim=True).clamp(min=1e-12))
+        return g_f * v_f / norm
+
+    @staticmethod
+    def _build_stage_arrays(kwlist, max_stages=16):
+        n_stages = min(len(kwlist), max_stages)
+        kind     = [0] * max_stages
+        patch    = [0] * max_stages
+        in_dim   = [0] * max_stages
+        d_model  = [0] * max_stages
+        n_heads  = [0] * max_stages
+        n_layers = [0] * max_stages
+        d_ff     = [0] * max_stages
+        out_dim  = [0] * max_stages
+        for i in range(n_stages):
+            m = kwlist[i]
+            if m['module_type'] == 'PatchedPretransform':
+                kind[i]  = 0
+                patch[i] = int(m['patch_size'])
+            elif m['module_type'] == 'Transformer':
+                kind[i]     = 1
+                in_dim[i]   = int(m['input_dimension'])
+                d_model[i]  = int(m['d_model'])
+                n_heads[i]  = int(m['num_heads'])
+                n_layers[i] = int(m['num_layers'])
+                d_ff[i]     = int(m['dim_feedforward'])
+                out_dim[i]  = int(m['output_dimension'])
+            else:
+                raise Exception(f"Unknown MOSS codec module_type: {m['module_type']}")
+        return [n_stages] + kind + patch + in_dim + d_model + n_heads + n_layers + d_ff + out_dim
+
+    @classmethod
+    def state_dict_pp(cls, config, state_dict):
+        is_nano = (config.get('model_type') == 'moss_tts_nano') or ('gpt2_config' in config and 'qwen3_config' not in config)
+        is_v15 = ('gpt2_config' in config) and not is_nano
+        r = {}
+
+        # Check if this state_dict comes from the audio codec checkpoint
+        is_codec_dict = any(
+            k.startswith('quantizer.') or k.startswith('encoder.') or k.startswith('decoder.')
+            for k in state_dict.keys()
+        )
+        if is_codec_dict:
+            for k in list(state_dict.keys()):
+                if '.parametrizations.weight.original0' in k:
+                    base = k.replace('.parametrizations.weight.original0', '')
+                    v_key = base + '.parametrizations.weight.original1'
+                    if v_key in state_dict:
+                        r['codec.' + base + '.weight'] = cls._fuse_wn(state_dict[k], state_dict[v_key])
+                elif '.parametrizations.weight.original1' in k:
+                    continue
+                elif k.endswith('.bias') or k.endswith('.weight') or k.endswith('.scale'):
+                    r['codec.' + k] = state_dict[k]
+            return r
+
+        for k, tensor in state_dict.items():
+            if is_nano:
+                if k == 'local_transformer.wte.weight':
+                    continue
+                if k == 'transformer.wte.weight':
+                    r['model.embed_tokens.weight'] = tensor
+                    r['lm_heads.0.weight'] = tensor
+                elif k == 'transformer.ln_f.weight':
+                    r['model.norm.weight'] = tensor
+                elif k == 'transformer.ln_f.bias':
+                    r['model.norm.bias'] = tensor
+                elif k.startswith('transformer.h.'):
+                    r['model.layers.' + k[len('transformer.h.'):]] = tensor
+                elif k.startswith('audio_embeddings.') and k.endswith('.weight'):
+                    parts = k.split('.')
+                    idx = int(parts[1])
+                    r[f'audio_lm_heads.{idx}.weight'] = tensor
+                    if tensor.shape[0] < cls.audio_embed_rows:
+                        pad_rows = cls.audio_embed_rows - tensor.shape[0]
+                        zeros = torch.zeros((pad_rows, tensor.shape[1]), dtype=tensor.dtype, device=tensor.device)
+                        tensor = torch.cat([tensor, zeros], dim=0)
+                    r[k] = tensor
+                else:
+                    r[k] = tensor
+            elif is_v15:
+                if k == 'text_lm_head.weight':
+                    continue
+                if k == 'transformer.embed_tokens.weight':
+                    r['model.embed_tokens.weight'] = tensor
+                elif k == 'transformer.norm.weight':
+                    r['model.norm.weight'] = tensor
+                elif k.startswith('transformer.layers.'):
+                    r['model.' + k[len('transformer.'):]] = tensor
+                elif k.startswith('audio_embeddings.') and k.endswith('.weight'):
+                    if tensor.shape[0] < cls.audio_embed_rows:
+                        pad_rows = cls.audio_embed_rows - tensor.shape[0]
+                        zeros = torch.zeros((pad_rows, tensor.shape[1]), dtype=tensor.dtype, device=tensor.device)
+                        tensor = torch.cat([tensor, zeros], dim=0)
+                    r[k] = tensor
+                else:
+                    r[k] = tensor
+            else:
+                if k == 'model.language_model.embed_tokens.weight':
+                    continue
+                if k == 'model.language_model.norm.weight':
+                    r['model.norm.weight'] = tensor
+                elif k.startswith('model.language_model.layers.'):
+                    r['model.layers.' + k[len('model.language_model.layers.'):]] = tensor
+                elif k == 'model.embedding_list.0.weight':
+                    r['model.embed_tokens.weight'] = tensor
+                elif k.startswith('model.embedding_list.') and k.endswith('.weight'):
+                    parts = k.split('.')
+                    idx = int(parts[2])
+                    if idx >= 1:
+                        if tensor.shape[0] < cls.audio_embed_rows:
+                            pad_rows = cls.audio_embed_rows - tensor.shape[0]
+                            zeros = torch.zeros((pad_rows, tensor.shape[1]), dtype=tensor.dtype, device=tensor.device)
+                            tensor = torch.cat([tensor, zeros], dim=0)
+                        r[f'audio_embeddings.{idx - 1}.weight'] = tensor
+                elif k.startswith('lm_heads.') and k.endswith('.weight'):
+                    parts = k.split('.')
+                    idx = int(parts[1])
+                    if idx == 0:
+                        r['lm_heads.0.weight'] = tensor
+                    else:
+                        r[f'audio_lm_heads.{idx - 1}.weight'] = tensor
+                else:
+                    r[k] = tensor
+        return r
+
+    @staticmethod
+    def dump_config(f, config, ggml_type):
+        is_nano = (config.get('model_type') == 'moss_tts_nano') or ('gpt2_config' in config and 'qwen3_config' not in config)
+        is_v15 = ('gpt2_config' in config) and not is_nano
+        if is_nano:
+            gc = config['gpt2_config']
+            qwen_cfg = AttributeDict({
+                'vocab_size': int(gc.get('vocab_size', 16384)),
+                'hidden_size': int(gc.get('n_embd', 768)),
+                'num_attention_heads': int(gc.get('n_head', 12)),
+                'num_key_value_heads': int(gc.get('n_head', 12)),
+                'num_hidden_layers': int(gc.get('n_layer', 12)),
+                'intermediate_size': int(gc.get('n_inner', 3072)),
+                'max_position_embeddings': int(gc.get('n_positions', 32768)),
+                'head_dim': int(gc.get('n_embd', 768)) // int(gc.get('n_head', 12)),
+                'rope_theta': float(gc.get('rope_base', 10000.0)),
+                'rms_norm_eps': float(gc.get('layer_norm_epsilon', 1e-5)),
+                'hidden_act': 'silu',
+                'bos_token_id': int(gc.get('bos_token_id', 1)),
+                'eos_token_id': int(gc.get('eos_token_id', 2)),
+                'pad_token_id': int(config.get('pad_token_id', 0)),
+            })
+        else:
+            raw_qwen = config['qwen3_config'] if is_v15 else config['language_config']
+            qwen_cfg = AttributeDict(copy.deepcopy(raw_qwen))
+        qwen_cfg.use_sliding_window = False
+        qwen_cfg.attention_bias = False
+        qwen_cfg.output_router_logits = False
+        qwen_cfg.tie_word_embeddings = False
+        qwen_cfg.rope_scaling = None
+        qwen_cfg.moe_intermediate_size = None
+        qwen_cfg.num_experts = None
+        qwen_cfg.num_experts_per_tok = None
+        qwen_cfg.norm_topk_prob = False
+        qwen_cfg.decoder_sparse_step = None
+        qwen_cfg.mlp_only_layers = None
+        if qwen_cfg.head_dim is None:
+            qwen_cfg.head_dim = qwen_cfg.hidden_size // qwen_cfg.num_attention_heads
+        if qwen_cfg.bos_token_id is None:
+            qwen_cfg.bos_token_id = config.get('im_start_token_id', 151644)
+        if qwen_cfg.eos_token_id is None:
+            qwen_cfg.eos_token_id = config.get('im_end_token_id', 151645)
+        if qwen_cfg.pad_token_id is None:
+            qwen_cfg.pad_token_id = config.get('pad_token_id', 151643)
+        qwen_cfg.sep_token_id = -1
+
+        MossTTSConverter.qwen_cfg = qwen_cfg
+        QWen3Converter.dump_config(f, qwen_cfg, ggml_type)
+
+        if is_nano:
+            gc = config['gpt2_config']
+            global_arch           = 1
+            local_arch            = 2
+            local_hidden_size     = int(gc.get('n_embd', 768))
+            local_num_layers      = int(config.get('local_transformer_layers', 1))
+            local_num_heads       = int(gc.get('n_head', 12))
+            local_num_kv_heads    = int(gc.get('n_head', 12))
+            local_head_dim        = local_hidden_size // local_num_heads
+            local_ffn_hidden_size = int(gc.get('n_inner', 3072))
+            local_rope_theta      = float(gc.get('rope_base', 10000.0))
+            local_norm_eps        = float(gc.get('layer_norm_epsilon', 1e-5))
+
+            n_vq                    = int(config.get('n_vq', 16))
+            audio_vocab_size        = int(config.get('audio_vocab_size', 1024))
+            audio_pad_code          = int(config.get('audio_pad_code', 1024))
+            audio_embed_rows        = max(audio_vocab_size, audio_pad_code + 1)
+            additional_mlp_ffn_size = 0
+            bare_heads              = 1
+            local_text_head_mode    = 2
+            stereo                  = 1
+            sample_rate             = int(config.get('sampling_rate', config.get('sample_rate', 48000)))
+        elif is_v15:
+            gc = config['gpt2_config']
+            global_arch           = 0
+            local_arch            = 0
+            local_hidden_size     = int(gc['n_embd'])
+            local_num_layers      = int(gc['n_layer'])
+            local_num_heads       = int(gc['n_head'])
+            local_num_kv_heads    = int(gc['n_head'])
+            local_head_dim        = local_hidden_size // local_num_heads
+            local_ffn_hidden_size = int(gc['n_inner'])
+            local_rope_theta      = float(gc.get('rope_base', 1000000.0))
+            local_norm_eps        = float(gc.get('layer_norm_epsilon', 1e-6))
+
+            n_vq                    = int(config.get('n_vq', 12))
+            audio_vocab_size        = int(config.get('audio_vocab_size', 1024))
+            audio_pad_code          = int(config.get('audio_pad_token_id', config.get('audio_pad_code', 1024)))
+            audio_embed_rows        = max(audio_vocab_size, audio_pad_code + 1)
+            additional_mlp_ffn_size = 0
+            bare_heads              = 1
+            local_text_head_mode    = 1
+            stereo                  = 1
+            sample_rate             = int(config.get('sampling_rate', config.get('sample_rate', 48000)))
+        else:
+            global_arch           = 0
+            local_arch            = 1
+            local_hidden_size     = int(config['local_hidden_size'])
+            local_num_layers      = int(config['local_num_layers'])
+            local_ffn_hidden_size = int(config['local_ffn_hidden_size'])
+            local_head_dim        = int(config.get('local_head_dim', qwen_cfg.head_dim))
+            local_num_heads       = int(config.get('local_num_attention_heads', 16))
+            local_num_kv_heads    = int(config.get('local_num_key_value_heads', 8))
+            local_rope_theta      = float(qwen_cfg.rope_theta)
+            local_norm_eps        = float(qwen_cfg.rms_norm_eps)
+
+            n_vq                    = int(config.get('n_vq', 32))
+            audio_vocab_size        = int(config.get('audio_vocab_size', 1024)) + 1
+            audio_pad_code          = int(config.get('audio_pad_code', 1024))
+            audio_embed_rows        = max(audio_vocab_size, audio_pad_code + 1)
+            additional_mlp_ffn_size = int(config.get('additional_mlp_ffn_hidden_size', 2048))
+            bare_heads              = 0
+            local_text_head_mode    = 1 if str(config.get('local_text_head_mode', '')).lower() == 'binary' else 0
+            nch                     = int(config.get('audio_number_channels', config.get('number_audio_channels', config.get('number_channels', 1))))
+            stereo                  = 1 if nch == 2 else 0
+            sample_rate             = int(config.get('sampling_rate', config.get('sample_rate', 24000)))
+
+        MossTTSConverter.audio_embed_rows = audio_embed_rows
+
+        if is_nano:
+            pad_token_id                        = int(config.get('pad_token_id', 0))
+            im_start_token_id                   = int(config.get('im_start_token_id', 4))
+            im_end_token_id                     = int(config.get('im_end_token_id', 5))
+            audio_start_token_id                = int(config.get('audio_start_token_id', 6))
+            audio_end_token_id                  = int(config.get('audio_end_token_id', 7))
+            audio_user_slot_token_id            = int(config.get('audio_user_slot_token_id', 8))
+            audio_assistant_gen_slot_token_id   = int(config.get('audio_assistant_slot_token_id', 9))
+            audio_assistant_delay_slot_token_id = int(config.get('audio_assistant_slot_token_id', 9))
+        else:
+            pad_token_id                        = int(config.get('pad_token_id', 151643))
+            im_start_token_id                   = int(config.get('im_start_token_id', 151644))
+            im_end_token_id                     = int(config.get('im_end_token_id', 151645))
+            audio_start_token_id                = int(config.get('audio_start_token_id', 151669 if is_v15 else 151652))
+            audio_end_token_id                  = int(config.get('audio_end_token_id', 151670 if is_v15 else 151653))
+            audio_user_slot_token_id            = int(config.get('audio_user_slot_token_id', 151654))
+            audio_assistant_gen_slot_token_id   = int(config.get('audio_assistant_gen_slot_token_id', 151656))
+            audio_assistant_delay_slot_token_id = int(config.get('audio_assistant_delay_slot_token_id', 151662))
+
+        f.write(struct.pack("<iiiiiiiiff",
+            global_arch,
+            local_arch,
+            local_hidden_size,
+            local_num_layers,
+            local_num_heads,
+            local_num_kv_heads,
+            local_head_dim,
+            local_ffn_hidden_size,
+            local_rope_theta,
+            local_norm_eps,
+        ))
+
+        f.write(struct.pack("<iiiiiiiiiiiiiiiii",
+            n_vq,
+            audio_vocab_size,
+            audio_embed_rows,
+            additional_mlp_ffn_size,
+            bare_heads,
+            local_text_head_mode,
+            stereo,
+            sample_rate,
+            pad_token_id,
+            im_start_token_id,
+            im_end_token_id,
+            audio_start_token_id,
+            audio_end_token_id,
+            audio_user_slot_token_id,
+            audio_assistant_gen_slot_token_id,
+            audio_assistant_delay_slot_token_id,
+            audio_pad_code,
+        ))
+
+        MAX_CODEC_STAGES = 16
+        cc = MossTTSConverter.codec_config
+        if cc is not None:
+            has_codec = 1
+            qk = cc['quantizer_kwargs']
+            c_channels = int(cc.get('number_channels', 1))
+            c_interleave = 1 if (bool(cc.get('enable_channel_interleave', False)) and c_channels > 1) else 0
+            c_sr = int(cc.get('sample_rate', cc.get('sampling_rate', sample_rate)))
+            c_ds = int(cc.get('downsample_rate', 3840 if (is_v15 or is_nano) else 1920))
+            c_nq = int(qk['num_quantizers'])
+            c_cb_size = int(qk['codebook_size'])
+            c_cb_dim  = int(qk['codebook_dim'])
+            c_rvq_dim = int(qk['rvq_dim'])
+            c_code_dim = int(cc.get('code_dim', qk.get('output_dim', 768)))
+            c_ctx_sec  = float(cc.get('causal_transformer_context_duration', 10.0))
+            enc_vals = MossTTSConverter._build_stage_arrays(cc['encoder_kwargs'], MAX_CODEC_STAGES)
+            dec_vals = MossTTSConverter._build_stage_arrays(cc['decoder_kwargs'], MAX_CODEC_STAGES)
+        else:
+            has_codec = 0
+            c_sr, c_ds, c_nq, c_cb_size, c_cb_dim, c_rvq_dim, c_code_dim, c_channels, c_interleave = 0, 0, 0, 0, 0, 0, 0, 0, 0
+            c_ctx_sec = 0.0
+            enc_vals = [0] + [0] * (8 * MAX_CODEC_STAGES)
+            dec_vals = [0] + [0] * (8 * MAX_CODEC_STAGES)
+
+        f.write(struct.pack("<iiiiiiiiiif",
+            has_codec,
+            c_sr,
+            c_ds,
+            c_nq,
+            c_cb_size,
+            c_cb_dim,
+            c_rvq_dim,
+            c_code_dim,
+            c_channels,
+            c_interleave,
+            c_ctx_sec,
+        ))
+        f.write(struct.pack("<" + "i" * len(enc_vals), *enc_vals))
+        f.write(struct.pack("<" + "i" * len(dec_vals), *dec_vals))
+
+    @staticmethod
+    def get_weight_names(config):
+        is_nano = (config.get('model_type') == 'moss_tts_nano') or ('gpt2_config' in config and 'qwen3_config' not in config)
+        is_v15 = ('gpt2_config' in config) and not is_nano
+        qwen_cfg = MossTTSConverter.qwen_cfg
+
+        if is_nano:
+            gc = config['gpt2_config']
+            global_num_layers = int(gc.get('n_layer', 12))
+            local_num_layers = int(config.get('local_transformer_layers', 1))
+            n_vq = int(config.get('n_vq', 16))
+            weight_names = ["model.embed_tokens.weight"]
+            for i in range(global_num_layers):
+                weight_names += [
+                    f"model.layers.{i}.ln_1.weight",
+                    f"model.layers.{i}.ln_1.bias",
+                    f"model.layers.{i}.attn.c_attn.weight",
+                    f"model.layers.{i}.attn.c_attn.bias",
+                    f"model.layers.{i}.attn.c_proj.weight",
+                    f"model.layers.{i}.attn.c_proj.bias",
+                    f"model.layers.{i}.ln_2.weight",
+                    f"model.layers.{i}.ln_2.bias",
+                    f"model.layers.{i}.mlp.fc_in.weight",
+                    f"model.layers.{i}.mlp.fc_in.bias",
+                    f"model.layers.{i}.mlp.fc_out.weight",
+                    f"model.layers.{i}.mlp.fc_out.bias",
+                ]
+            weight_names += [
+                "model.norm.weight",
+                "model.norm.bias",
+            ]
+            for i in range(local_num_layers):
+                weight_names += [
+                    f"local_transformer.h.{i}.ln_1.weight",
+                    f"local_transformer.h.{i}.ln_1.bias",
+                    f"local_transformer.h.{i}.attn.c_attn.weight",
+                    f"local_transformer.h.{i}.attn.c_attn.bias",
+                    f"local_transformer.h.{i}.attn.c_proj.weight",
+                    f"local_transformer.h.{i}.attn.c_proj.bias",
+                    f"local_transformer.h.{i}.ln_2.weight",
+                    f"local_transformer.h.{i}.ln_2.bias",
+                    f"local_transformer.h.{i}.mlp.fc_in.weight",
+                    f"local_transformer.h.{i}.mlp.fc_in.bias",
+                    f"local_transformer.h.{i}.mlp.fc_out.weight",
+                    f"local_transformer.h.{i}.mlp.fc_out.bias",
+                ]
+            weight_names += [
+                "local_transformer.ln_f.weight",
+                "local_transformer.ln_f.bias",
+            ]
+            for c in range(n_vq):
+                weight_names.append(f"audio_embeddings.{c}.weight")
+            weight_names.append("lm_heads.0.weight")
+            for c in range(n_vq):
+                weight_names.append(f"audio_lm_heads.{c}.weight")
+        elif is_v15:
+            QWen3Converter.has_lm_head = False
+            weight_names = QWen3Converter.get_weight_names(qwen_cfg)
+            QWen3Converter.has_lm_head = True
+            gc = config['gpt2_config']
+            local_num_layers = int(gc['n_layer'])
+            n_vq = int(config.get('n_vq', 12))
+            for i in range(local_num_layers):
+                weight_names += [
+                    f"local_transformer.h.{i}.ln_1.weight",
+                    f"local_transformer.h.{i}.ln_1.bias",
+                    f"local_transformer.h.{i}.attn.c_attn.weight",
+                    f"local_transformer.h.{i}.attn.c_attn.bias",
+                    f"local_transformer.h.{i}.attn.c_proj.weight",
+                    f"local_transformer.h.{i}.attn.c_proj.bias",
+                    f"local_transformer.h.{i}.ln_2.weight",
+                    f"local_transformer.h.{i}.ln_2.bias",
+                    f"local_transformer.h.{i}.mlp.fc_in.weight",
+                    f"local_transformer.h.{i}.mlp.fc_in.bias",
+                    f"local_transformer.h.{i}.mlp.fc_out.weight",
+                    f"local_transformer.h.{i}.mlp.fc_out.bias",
+                ]
+            weight_names += [
+                "local_transformer.ln_f.weight",
+                "local_transformer.ln_f.bias",
+            ]
+            for c in range(n_vq):
+                weight_names.append(f"audio_embeddings.{c}.weight")
+            weight_names.append("local_text_lm_head.weight")
+            for c in range(n_vq):
+                weight_names.append(f"audio_lm_heads.{c}.weight")
+        else:
+            QWen3Converter.has_lm_head = False
+            weight_names = QWen3Converter.get_weight_names(qwen_cfg)
+            QWen3Converter.has_lm_head = True
+            local_num_layers = int(config['local_num_layers'])
+            n_vq = int(config.get('n_vq', 32))
+            for i in range(local_num_layers):
+                weight_names += [
+                    f"local_transformer.layers.{i}.input_layernorm.weight",
+                    f"local_transformer.layers.{i}.self_attn.q_proj.weight",
+                    f"local_transformer.layers.{i}.self_attn.k_proj.weight",
+                    f"local_transformer.layers.{i}.self_attn.v_proj.weight",
+                    f"local_transformer.layers.{i}.self_attn.o_proj.weight",
+                    f"local_transformer.layers.{i}.self_attn.q_norm.weight",
+                    f"local_transformer.layers.{i}.self_attn.k_norm.weight",
+                    f"local_transformer.layers.{i}.post_attention_layernorm.weight",
+                    f"local_transformer.layers.{i}.mlp.gate_proj.weight",
+                    f"local_transformer.layers.{i}.mlp.up_proj.weight",
+                    f"local_transformer.layers.{i}.mlp.down_proj.weight",
+                ]
+            weight_names.append("local_transformer.norm.weight")
+            for c in range(n_vq):
+                weight_names.append(f"audio_embeddings.{c}.weight")
+            weight_names += [
+                "speech_embedding_to_local_mlp.gate_proj.weight",
+                "speech_embedding_to_local_mlp.up_proj.weight",
+                "speech_embedding_to_local_mlp.down_proj.weight",
+            ]
+            for c in range(1 + n_vq):
+                weight_names += [
+                    f"local_to_speech_embedding_mlps.{c}.gate_proj.weight",
+                    f"local_to_speech_embedding_mlps.{c}.up_proj.weight",
+                    f"local_to_speech_embedding_mlps.{c}.down_proj.weight",
+                    f"layer_norm_before_lm_heads.{c}.weight",
+                ]
+            weight_names.append("lm_heads.0.weight")
+            for c in range(n_vq):
+                weight_names.append(f"audio_lm_heads.{c}.weight")
+
+        if MossTTSConverter.codec_files:
+            codec_raw_names = get_all_tensors(MossTTSConverter.codec_files)
+            seen_codec = set()
+            for k in codec_raw_names:
+                if '.parametrizations.weight.original0' in k:
+                    out_k = 'codec.' + k.replace('.parametrizations.weight.original0', '.weight')
+                elif '.parametrizations.weight.original1' in k:
+                    continue
+                elif k.endswith('.bias') or k.endswith('.weight') or k.endswith('.scale'):
+                    out_k = 'codec.' + k
+                else:
+                    continue
+                if out_k not in seen_codec:
+                    seen_codec.add(out_k)
+                    weight_names.append(out_k)
+
+        return weight_names
+
+
 class QWen3EmbConverter(BaseConverter):
     MODEL_TYPE = ModelType.QWen3_Embedding
 
@@ -10825,6 +11316,7 @@ def main():
     parser.add_argument("--native_name", type=str, default='', help='model native name')
     parser.add_argument("--snac_model", type=str, default='', help='snac model path (required by Orpheus-TTS, etc)')
     parser.add_argument("--dac_model", type=str, default='', help='dac model path (required by Oute-TTS, etc)')
+    parser.add_argument("--codec_model", type=str, default='', help='audio codec model path (optional for MOSS-TTS)')
     args = parser.parse_args()
 
     for l in reversed(args.tensor_type):
@@ -10910,6 +11402,18 @@ def main():
         model_files += load_some_model(Qwen3TTSConverter.model_path / 'speech_tokenizer')
         Qwen3TTSConverter.model_files = model_files
         load_some_info(g_model_meta, Qwen3TTSConverter.model_path / 'speech_tokenizer', 'speech_tokenizer-')
+    elif arch in ['MossTTSLocal', 'MossTTSLocalModel', 'MossTTSDelay', 'MossTTSDelayModel', 'MossTTSNanoForCausalLM', 'moss_tts_nano', 'moss-tts']:
+        codec_dir = None
+        if args.codec_model != '':
+            codec_dir = Path(args.codec_model)
+        elif (Path(args.model_name_or_path) / 'audio_tokenizer').exists():
+            codec_dir = Path(args.model_name_or_path) / 'audio_tokenizer'
+        if codec_dir is not None and (codec_dir / 'config.json').exists():
+            MossTTSConverter.codec_config = load_config(codec_dir, 'config.json')
+            MossTTSConverter.codec_files = load_some_model(codec_dir)
+            model_files += MossTTSConverter.codec_files
+            load_some_info(g_model_meta, codec_dir, 'audio_tokenizer-')
+        MossTTSConverter.model_files = model_files
 
     #if args.lora_model_name_or_path is not None:
     #    from peft import PeftModel
@@ -11382,6 +11886,8 @@ def main():
         MiniCPM5Converter.convert(config, model_files, vocab, ggml_type, args.save_path)
     elif arch == 'teleocr':
         TeleOCRConverter.convert(config, model_files, vocab, ggml_type, args.save_path)
+    elif arch in ['MossTTSLocal', 'MossTTSLocalModel', 'MossTTSDelay', 'MossTTSDelayModel', 'MossTTSNanoForCausalLM', 'moss_tts_nano', 'moss-tts']:
+        MossTTSConverter.convert(config, model_files, vocab, ggml_type, args.save_path)
     else:
         raise Exception(f'unknown model_type: {arch}')
 

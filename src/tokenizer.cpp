@@ -126,7 +126,9 @@ struct llama_sp_tokenizer
                 // output any symbols that did not form tokens as bytes.
                 for (int j = 0; j < (int)symbol.n; ++j)
                 {
-                    _vocab::id token_id = static_cast<uint8_t>(symbol.text[j]) + 3;
+                    _vocab::id token_id = vocab_.byte_fallback_ready
+                        ? vocab_.byte_fallback_tok_ids[static_cast<uint8_t>(symbol.text[j])]
+                        : (static_cast<uint8_t>(symbol.text[j]) + 3);
                     output.push_back(token_id);
                 }
             }

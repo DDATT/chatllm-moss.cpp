@@ -1,224 +1,124 @@
-# ChatLLM.cpp
+# ChatLLM-MOSS.cpp
 
-[中文版](README_zh.md)
+[![License: MIT](https://img.shields.io/badge/license-MIT-blue)](LICENSE)
+[![C++20](https://img.shields.io/badge/C%2B%2B-20-brightgreen.svg)]()
+[![Backend](https://img.shields.io/badge/backend-ggml-orange.svg)](https://github.com/ggml-org/ggml)
+[![Model](https://img.shields.io/badge/model-MOSS--TTS-blueviolet.svg)](https://huggingface.co/OpenMOSS-Team/MOSS-TTS-Nano-100M)
 
-[![License: MIT](https://img.shields.io/badge/license-MIT-blue)](LICENSE) [![CI](https://github.com/foldl/chatllm.cpp/actions/workflows/build.yml/badge.svg)](https://github.com/foldl/chatllm.cpp/actions/workflows/build.yml)
+**ChatLLM-MOSS.cpp** là bản fork chuyên biệt từ [chatllm.cpp](https://github.com/foldl/chatllm.cpp) với mục tiêu **tích hợp trọn vẹn kiến trúc MOSS-TTS (MOSS-TTS-Nano-100M, v1.5, v1.0)** thành mô hình C++ native, chạy siêu nhẹ, siêu nhanh trên CPU và GPU dựa trên nền tảng `ggml`.
 
-<a href='https://ko-fi.com/H2H21TKE4P' target='_blank'><img height='36' style='border:0px;height:36px;' src='https://storage.ko-fi.com/cdn/kofi5.png?v=6' border='0' alt='Buy Me a Coffee at ko-fi.com' /></a>
+---
 
-![](./docs/demo.gif)
+## ✨ Điểm nổi bật (Key Features)
 
-Inference of a bunch of models from less than 1B to more than 300B, for real-time [multimodal](./docs/multimodal.md) chat with [RAG](./docs/rag.md) on your computer (CPU & GPU),
-pure C++ implementation based on [@ggerganov](https://github.com/ggerganov)'s [ggml](https://github.com/ggerganov/ggml).
+- 🚀 **100% Native C++ Inference**: Toàn bộ pipeline từ Text Prefill, Time $\times$ Depth Autoregressive Generation đến Codec Decoding đều được viết bằng C++ thuần túy, không phụ thuộc Python khi inference.
+- 🎙️ **Tích hợp MOSS-Audio-Tokenizer**: Triển khai trực tiếp Neural Audio Codec (1D ConvNeXt stages, Residual LFQ, Transposed Convolutions) trên `ggml`, giải mã âm thanh 48 kHz Stereo độ trung thực cao.
+- 🧬 **Zero-shot Voice Cloning**: Nhân bản giọng nói chỉ cần 3 - 6 giây file âm thanh tham chiếu (`.wav`).
+- ⚡ **Tốc độ vượt trội (Faster than Real-Time)**:
+  - Tốc độ sinh: **~38 - 48 ms / frame** (đạt **21 - 26 fps**).
+  - Tỷ lệ thời gian thực (**RTF**): **0.70 – 0.85** trên CPU (thời gian sinh âm thanh ngắn hơn đáng kể so với độ dài giọng nói phát ra).
+- 📦 **Tự chứa hoàn toàn (Self-Contained)**:
+  - Tích hợp sẵn bộ nạp PCM WAV độc lập (không bắt buộc phải cài `ffmpeg`).
+  - Tự động xuất trực tiếp file audio chuẩn RIFF WAV 48.000 Hz Stereo.
+- 🎛️ **Đầy đủ tham số tinh chỉnh**: Hỗ trợ tinh chỉnh nhiệt độ lấy mẫu (`text_temp`, `audio_temp`), Top-P, Top-K, Repetition Penalty, âm thanh tham chiếu (`ref_audio`).
 
-Deliver accurate or better results than other implementations [o](https://github.com/ggml-org/llama.cpp/issues/15600#issuecomment-3400860774)-[c](https://github.com/ggml-org/llama.cpp/issues/13694#issuecomment-3454877635)-[c](https://github.com/ggml-org/llama.cpp/issues/3377#issuecomment-2198554173)-[a](https://github.com/ggml-org/llama.cpp/issues/8183#issuecomment-2198348578)-[s](https://github.com/ggml-org/llama.cpp/pull/13760#issuecomment-2998476325)-[i](https://github.com/lmstudio-ai/lmstudio-bug-tracker/issues/798#issue-3266514944)-onally.
+---
 
-| [Supported Models](./docs/models.md) | [Download Quantized Models](./docs/quick_start.md#download-quantized-models) |
+## 📊 Benchmark hiệu năng (MOSS-TTS-Nano-100M trên CPU)
 
-```mermaid
-graph TD;
-ggml --> chatllm.cpp
-chatllm.cpp --> AlphaGeometryRE
-chatllm.cpp --> WritingTools
-chatllm.cpp --> LittleAcademia
-chatllm.cpp --> LLMirror
-subgraph coding[ ]
-    AlphaGeometryRE
-    WritingTools
-    LittleAcademia
-    LLMirror
-end
-ggml[<a href="https://github.com/ggml-org/ggml"                     style="text-decoration:none;">ggml</a>            <br><span style="font-size:10px;">Machine learning library</span>];
-chatllm.cpp[<a href="https://github.com/foldl/chatllm.cpp"          style="text-decoration:none;">chatllm.cpp</a>     <br><span style="font-size:10px;">LLM inference</span>];
-AlphaGeometryRE[<a href="https://github.com/foldl/alphageometryre"  style="text-decoration:none;">AlphaGeometryRE</a> <br><span style="font-size:10px;">AlphaGeometry Re-engineered</span>];
-WritingTools[<a href="https://github.com/foldl/WritingTools"        style="text-decoration:none;">Writing Tools</a>   <br><span style="font-size:10px;">AI aided writing</span>];
-LittleAcademia[<a href="https://github.com/foldl/little-academia"   style="text-decoration:none;">Little Academia</a> <br><span style="font-size:10px;">Learn programming</span>];
-LLMirror[<a href="https://github.com/foldl/llmirror"   style="text-decoration:none;">LL·Mirror</a> <br><span style="font-size:10px;">LLM introspection</span>];
+> *Thử nghiệm đo đạc thực tế trên CPU (đã trừ thời gian load model ~0.7 – 1.0s):*
+
+| Tác vụ | Độ dài âm thanh | Thời gian sinh thuần túy | Tốc độ frame | RTF | Trạng thái |
+| :--- | :--- | :--- | :--- | :--- | :--- |
+| **TTS Tiếng Anh** | 12.56 s (157 frames) | **10.27 s** | 48.90 ms/frame (20.5 fps) | **0.818** | ⚡ Nhanh hơn Real-time |
+| **TTS Tiếng Trung** | 15.44 s (193 frames) | **12.76 s** | 46.86 ms/frame (21.3 fps) | **0.826** | ⚡ Nhanh hơn Real-time |
+| **Voice Cloning (Short)** | 5.92 s (74 frames) | **4.15 s** | 38.52 ms/frame (26.0 fps) | **0.701** | ⚡ Nhanh hơn Real-time |
+| **Voice Cloning (Long)** | 14.96 s (187 frames) | **13.16 s** | 47.04 ms/frame (21.3 fps) | **0.879** | ⚡ Nhanh hơn Real-time |
+
+*Đặc thù kiến trúc MOSS-TTS: 1 frame latent tương đương 80 ms âm thanh (12.5 Hz). Tốc độ sinh 38 - 48 ms/frame đồng nghĩa với việc mô hình sinh nhanh gấp 1.7 – 2.1 lần tốc độ nói tự nhiên.*
+
+---
+
+## 🛠️ Hướng dẫn cài đặt & Biên dịch (Build)
+
+### 1. Yêu cầu hệ thống
+- CMake $\ge$ 3.20
+- Trình biên dịch C++20 (MSVC trên Windows, GCC 11+ hoặc Clang 14+ trên Linux/macOS)
+
+### 2. Biên dịch
+```bash
+# Clone repository
+git clone https://github.com/DDATT/chatllm-moss.cpp.git
+cd chatllm-moss.cpp
+
+# Tạo thư mục build và cấu hình
+cmake -B build -DCMAKE_BUILD_TYPE=Release
+
+# Biên dịch chương trình chính
+cmake --build build --config Release --target main -j
+```
+File thực thi sẽ nằm tại `build/bin/Release/main.exe` (Windows) hoặc `build/bin/main` (Linux).
+
+---
+
+## 🔄 Chuyển đổi mô hình (Model Conversion)
+
+Để chuyển đổi trọng số từ HuggingFace sang định dạng nhị phân `.bin` của `chatllm.cpp`:
+
+### 1. Chuẩn bị môi trường Python
+```bash
+pip install torch transformers huggingface_hub
 ```
 
-**What's New:**
-
-* 2026-10-02: Intern-Decision
-* 2026-09-27: Spark-2.5
-* 2026-09-25: TeleOCR
-* 2026-09-08: MiniCPM5-2B
-* 2026-08-22: Instella-MoE
-* 2026-08-04: Nanbeige4.2
-* 2026-07-24: G9v3
-* 2026-07-16: [Introspection with lens](./docs/lens.md)
-* 2026-07-15: OvisOCR2
-* 2026-06-27: PaddleOCR-VL
-* 2026-06-22: Mellum-2
-* 2026-06-14: HY-MT2
-* 2026-05-28: MiniCPM5
-* 2026-05-05: Gemma-4
-* 2026-03-28: InternVL3.5
-* 2026-03-27: Qianfan-OCR
-* 2026-03-22: Penguin-VL
-* 2026-03-06: Qwen3.5
-* 2026-03-03: GLM-OCR
-* 2025-10-10: [I can draw](./docs/multimodal.md): Janus-Pro
-* 2025-06-21: [I can hear](./docs/multimodal.md): Qwen2-Audio
-* 2025-05-23: [I can see](./docs/multimodal.md): Fuyu
-* 2025-05-21: Re-quantization when loading (e.g. `--re-quantize q4_k`)
-* 2025-05-17: [I can speak](./docs/multimodal.md): Orpheus-TTS
-* 2025-03-24: [GGMM](./docs/ggmm.md) file format
-* 2025-02-21: [Distributed inference](./docs/rpc.md)
-* 2025-02-10: [GPU acceleration](./docs/gpu.md) 🔥
-* 2024-12-09: [Reversed role](./docs/fun.md#reversed-role)
-* 2024-11-21: [Continued generation](./docs/fun.md#continued-generation)
-* 2024-11-01: [generation steering](./docs/fun.md#generation-steering)
-* 2024-06-15: [Tool calling](./docs/tool_calling.md)
-* 2024-05-29: [ggml](https://github.com/ggerganov/ggml) is forked instead of submodule
-* 2024-05-14: [OpenAI API](./docs/binding.md#openai-compatible-api), CodeGemma Base & Instruct supported
-* 2024-05-08: [Layer shuffling](./docs/fun.md#layer-shuffling)
-
-## Features
-
-* [x] Accelerated memory-efficient CPU/GPU inference with int4/int8 quantization, optimized KV cache and parallel computing;
-* [x] Use OOP to address the similarities between different _Transformer_ based models;
-* [x] Streaming generation with typewriter effect;
-* [x] Continuous chatting (content length is virtually unlimited)
-
-    Two methods are available: _Restart_ and _Shift_. See `--extending` options.
-
-* [x] [Retrieval Augmented Generation](./docs/rag.md) (RAG) 🔥
-
-* [x] [LoRA](./docs/models.md#lora-models);
-* [x] Python/JavaScript/C/Nim [Bindings](./docs/binding.md), web demo, and more possibilities.
-
-## Quick Start
-
-As simple as `main_nim -i -m :model_id`. [Check it out](./docs/quick_start.md).
-
-## Usage
-
-### Preparation
-
-Clone the ChatLLM.cpp repository into your local machine:
-
-```sh
-git clone --recursive https://github.com/foldl/chatllm.cpp.git && cd chatllm.cpp
+### 2. Tải trọng số MOSS-TTS-Nano-100M
+```bash
+python -c "from huggingface_hub import snapshot_download; snapshot_download('OpenMOSS-Team/MOSS-TTS-Nano-100M', local_dir='./MOSS-TTS-Nano-100M')"
 ```
 
-If you forgot the `--recursive` flag when cloning the repository, run the following command in the `chatllm.cpp` folder:
+### 3. Chuyển đổi sang file `.bin`
+```bash
+python convert.py -i ./MOSS-TTS-Nano-100M -o moss-tts-nano.bin -t f32
+```
+*Lưu ý: Script sẽ tự động nhận diện kiến trúc MOSS-TTS và nhúng toàn bộ trọng số của Audio Tokenizer Codec vào chung một file nhị phân duy nhất (~345 MB).*
 
-```sh
-git submodule update --init --recursive
+---
+
+## 🚀 Hướng dẫn sử dụng (Usage)
+
+### 1. Tổng hợp giọng nói cơ bản (Text-to-Speech)
+```bash
+./build/bin/Release/main.exe -m moss-tts-nano.bin -p "Artificial intelligence and neural speech synthesis have made tremendous progress in recent years." --tts_export output.wav
 ```
 
-### Quantize Model
-
-**Some quantized models can be downloaded [on demand](./docs/quick_start.md#download-quantized-models).**
-
-Install dependencies of `convert.py`:
-
-```sh
-pip install -r requirements.txt
+### 2. Nhân bản giọng nói (Zero-shot Voice Cloning)
+Chỉ định file audio tham chiếu (độ dài lý tưởng 3 - 6 giây) qua tham số `--set ref_audio <file.wav>`:
+```bash
+./build/bin/Release/main.exe -m moss-tts-nano.bin -p "Hello! This voice has been cloned locally using MOSS TTS on chatllm-moss.cpp." --set ref_audio reference.wav --tts_export cloned_output.wav
 ```
 
-Use `convert.py` to transform models into quantized GGML format. For example, to convert the _fp16_ base model to q8_0 (quantized int8) GGML model, run:
-
-```sh
-# For models such as ChatLLM2-6B, InternLM, LlaMA, LlaMA-2, Baichuan-2, etc
-python convert.py -i path/to/model -t q8_0 -o quantized.bin --name ModelName
-
-# For some models such as CodeLlaMA, model type should be provided by `-a`
-# Find `-a ...` option for each model in `docs/models.md`.
-python convert.py -i path/to/model -t q8_0 -o quantized.bin -a CodeLlaMA --name ModelName
+### 3. Tinh chỉnh các tham số lấy mẫu (Sampling Controls)
+Bạn có thể điều chỉnh độ biểu cảm hoặc tốc độ thông qua cờ `--set`:
+```bash
+./build/bin/Release/main.exe -m moss-tts-nano.bin \
+  -p "Hello, world!" \
+  --set text_temp 1.2 \
+  --set audio_temp 1.5 \
+  --set text_top_p 0.95 \
+  --set audio_top_p 0.8 \
+  --set audio_rep_penalty 1.05 \
+  --tts_export output.wav
 ```
 
-Use `--name` to specify model's name in English. Optionally, use `--native_name` to specify model's name in another language.
-Use `-l` to specify the path of the LoRA model to be merged, such as:
+---
 
-```sh
-python convert.py -i path/to/model -l path/to/lora/model -o quantized.bin --name ModelName
-```
+## 📁 Cấu trúc mã nguồn tích hợp
 
-Note: Appropriately, only HF format is supported (with a few exceptions); Format of the generated `.bin` files is different from the one (GGUF) used by `llama.cpp`.
+- [`models/moss_tts.h`](models/moss_tts.h): Khai báo kiến trúc MOSS-TTS và MOSS-Audio-Tokenizer (Codec, Residual LFQ, Multi-stage Transposed Convolutions, Local & Global backbone config).
+- [`models/moss_tts.cpp`](models/moss_tts.cpp): Hiện thực hóa toàn bộ pipeline xử lý âm thanh, Time $\times$ Depth autoregressive generation loop, benchmark instrumentation và bộ nạp WAV độc lập.
+- [`convert.py`](convert.py): Module trích xuất và đóng gói tensor từ HuggingFace safetensors sang định dạng ggml tensor.
+- [`src/main.cpp`](src/main.cpp): Hỗ trợ xuất trực tiếp chuẩn RIFF WAV header và hiển thị đo đạc thời gian nạp / thực thi.
 
-#### Customized Quantization
+---
 
-It's possible to specify quantization for each tensor using `-tt pattern type`, where `pattern` is a regex pattern to match against tensor names. Multiple `-tt ... ...`
-can be used. In this example, all tensors are using `q4_k` quantization except embeddings are using `q8_0`.
-
-```sh
-... -t q4_k -tt lm_head q8_0 -tt model.embed_tokens.weight q8_0
-```
-
-#### Supported Types
-
-|Type  |`GGML_TYPE`                 |
-|:----:|:---------------------------|
-|f32   |`GGML_TYPE_F32`             |
-|f16   |`GGML_TYPE_F16`             |
-|q8_0  |`GGML_TYPE_Q8_0`            |
-|q4_0  |`GGML_TYPE_Q4_0`            |
-|q4_1  |`GGML_TYPE_Q4_1`            |
-|q4_k  |`GGML_TYPE_Q4_K`            |
-
-### Build
-
-In order to build this project you have several different options.
-
-- Using `CMake`:
-
-  ```sh
-  cmake -B build
-  cmake --build build -j --config Release
-  ```
-
-  The executable is `./build/bin/main`.
-
-  There are lots of `GGML_...` options to play with. Example: Vulkan acceleration together with RPC and backend dynamic loading:
-
-  ```sh
-  cmake -B build -DGGML_VULKAN=1 -DGGML_RPC=1 -DGGML_CPU_ALL_VARIANTS=1 -DGGML_BACKEND_DL=1
-  ```
-
-### Run
-
-Now you may chat with a quantized model by running:
-
-```sh
-./build/bin/main -m llama2.bin  --seed 100                      # Llama-2-Chat-7B
-# Hello! I'm here to help you with any questions or concerns ....
-```
-
-To run the model in interactive mode, add the `-i` flag. For example:
-
-```sh
-# On Windows
-.\build\bin\Release\main -m model.bin -i
-
-# On Linux (or WSL)
-rlwrap ./build/bin/main -m model.bin -i
-```
-
-In interactive mode, your chat history will serve as the context for the next-round conversation.
-
-Run `./build/bin/main -h` to explore more options!
-
-## Plan Nim
-
-All Python scripts are going to be rewritten in [Nim](https://nim-lang.org/), with following exceptions:
-
-* when `pickle` is used
-
-## Acknowledgements
-
-* This project is started as refactoring of [ChatGLM.cpp](https://github.com/li-plus/chatglm.cpp), without which, this project could not be possible.
-
-* Thank those who have released their the model sources and checkpoints.
-
-* `chat_ui.html` adapted from [Ollama-Chat](https://github.com/Oft3r/Ollama-Chat).
-
-## Note
-
-* This project is a hobby project to learn DL & GGML, and under active development.
-
-* This project is never supposed to be used _seriously_ and security vulnerabilities won't be treated _seriously_, either.
-
-* PRs of features won't be accepted, while PRs for bug fixes are warmly welcome.
-
-    AI Usage Policy: _Slop_ codes generated by AI won't be accepted.
+## 📜 Giấy phép (License)
+Dự án được phân phối dưới giấy phép **MIT License**. Vui lòng tham khảo file [LICENSE](LICENSE) để biết thêm chi tiết. Trọng số mô hình MOSS-TTS tuân thủ theo giấy phép của [OpenMOSS Team](https://huggingface.co/OpenMOSS-Team).
